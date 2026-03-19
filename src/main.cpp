@@ -20,49 +20,123 @@ static NimBLEUUID FTMS_CTRL_CHR_UUID("2AD9");
 static NimBLEUUID CSC_SVC_UUID("1816");       
 static NimBLEUUID CSC_MEAS_CHR_UUID("2A5B");  
 
-// --- GLOBAL VARIABLES ---
-volatile float livePower = 10.0, liveCadence = 10.0;
-volatile float lastGradeReceived = 10.0;
-volatile bool trainerConnected = false, zwiftConnected = false;
-volatile bool doConnect = false;
-
-// Cadence control variables (CSC)
-volatile uint32_t lastRevCount = 0;
-volatile uint16_t lastEventTime = 0;
-volatile unsigned long lastCadenceUpdateMillis = 0;
-
-volatile bool pendingIndicate = false;
-volatile uint8_t pendingOpCode = 0x00;
-
+// --- ENUMS ---
 enum ControlState { IDLE, SEND_REQ_CTRL, SEND_POWER, SEND_SIMULATION, SEND_GENERIC };
-volatile ControlState ergState = IDLE;
 
-const int THRESHOLDS[] = {127, 173, 207, 242, 276, 310, 345};
-const int DEADBAND = 5;
-int currentZone = 0;
+// --- SHARED STATE (Cross-Core) ---
+struct SharedBridgeState {
+    // Bike Metrics
+    volatile float power = 10.0;
+    volatile float cadence = 10.0;
+    volatile float grade = 10.0;
 
-const uint8_t zonesRGB[8][3] = {
-  {150, 150, 150}, {0, 0, 255}, {0, 255, 0}, {139, 69, 19}, 
-  {255, 200, 0}, {255, 100, 0}, {139, 0, 0}, {128, 0, 128}
+    // Connection Flags
+    volatile bool trainerConnected = false;
+    volatile bool zwiftConnected = false;
+    volatile bool doConnect = false;
+
+    // Cadence Control (CSC)
+    volatile uint32_t lastRevCount = 0;
+    volatile uint16_t lastEventTime = 0;
+    volatile unsigned long lastCadenceUpdateMillis = 0;
+
+    // Zwift Control Commands
+    volatile bool pendingIndicate = false;
+    volatile uint8_t pendingOpCode = 0x00;
+    volatile ControlState ergState = IDLE;
+
+    // Payloads
+    uint8_t targetPowerPayload[2] = {0x00, 0x00};
+    uint8_t targetSimPayload[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
+    uint8_t genericPayload[20];
+    size_t genericLen = 0;
 };
 
-uint8_t targetPowerPayload[2] = {0x00, 0x00};
-uint8_t targetSimPayload[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
-uint8_t genericPayload[20];
-size_t genericLen = 0;
+// --- BLE POINTER CONTEXT ---
+struct BLEContext {
+    NimBLEClient* client = nullptr;
+    NimBLERemoteCharacteristic* remoteControlChar = nullptr;
+    NimBLECharacteristic* bikeDataChar = nullptr;
+    NimBLECharacteristic* serverControlChar = nullptr;
+    NimBLEAdvertisedDevice* targetDevice = nullptr;
+};
 
-NimBLEClient* pClient = nullptr;
-NimBLERemoteCharacteristic* pRemoteControlChar = nullptr;
-NimBLECharacteristic *pBikeDataChar, *pServerControlChar;
-NimBLEAdvertisedDevice* targetDevice = nullptr;
+// Global instantiations
+SharedBridgeState state;
+BLEContext ble;
+
+// --- LED INDICATOR MODULE ---
+class LEDIndicator {
+private:
+    const int THRESHOLDS[7] = {127, 173, 207, 242, 276, 310, 345};
+    const int DEADBAND = 5;
+    int currentZone = 0;
+    
+    const uint8_t zonesRGB[8][3] = {
+        {150, 150, 150}, {0, 0, 255}, {0, 255, 0}, {139, 69, 19}, 
+        {255, 200, 0}, {255, 100, 0}, {139, 0, 0}, {128, 0, 128}
+    };
+    
+    unsigned long lastBlink = 0;
+    bool ledOn = false;
+    bool ledWasOff = false;
+
+public:
+    void begin() {
+        led.begin();
+        led.setBrightness(20);
+        turnOff();
+    }
+
+    void turnOff() {
+        if (!ledWasOff) {
+            led.setPixelColor(0, 0); 
+            led.show();
+            ledWasOff = true;
+        }
+    }
+
+    void update(float power, float cadence) {
+        ledWasOff = false;
+        int p = (int)power;
+        int newZone = 0;
+
+        // Calculate active zone with hysteresis (deadband)
+        if      (p > THRESHOLDS[6] + (currentZone == 7 ? -DEADBAND : 0)) newZone = 7;
+        else if (p > THRESHOLDS[5] + (currentZone == 6 ? -DEADBAND : 0)) newZone = 6;
+        else if (p > THRESHOLDS[4] + (currentZone == 5 ? -DEADBAND : 0)) newZone = 5;
+        else if (p > THRESHOLDS[3] + (currentZone == 4 ? -DEADBAND : 0)) newZone = 4;
+        else if (p > THRESHOLDS[2] + (currentZone == 3 ? -DEADBAND : 0)) newZone = 3;
+        else if (p > THRESHOLDS[1] + (currentZone == 2 ? -DEADBAND : 0)) newZone = 2;
+        else if (p > THRESHOLDS[0] + (currentZone == 1 ? -DEADBAND : 0)) newZone = 1;
+        else newZone = 0;
+        
+        currentZone = newZone;
+
+        // Adjust blink speed based on cadence
+        unsigned long interval = 60000 / (cadence > 30 ? cadence : 60); 
+        if (millis() - lastBlink >= (ledOn ? 100 : interval - 100)) {
+            lastBlink = millis();
+            ledOn = !ledOn;
+            if (ledOn) {
+                led.setPixelColor(0, led.Color(zonesRGB[currentZone][0], zonesRGB[currentZone][1], zonesRGB[currentZone][2]));
+            } else {
+                led.setPixelColor(0, 0); 
+            }
+            led.show();
+        }
+    }
+};
+
+LEDIndicator statusLed;
 
 // --- TRAINER DISCONNECTION CALLBACKS (CLIENT) ---
 class TrainerClientCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pClient) {
-        trainerConnected = false;
-        doConnect = false;
-        livePower = 0;
-        liveCadence = 0;
+        state.trainerConnected = false;
+        state.doConnect = false;
+        state.power = 0;
+        state.cadence = 0;
         Serial.println("!!! [ALERT] Physical Trainer lost signal. Supervisor will take over.");
     }
 };
@@ -79,14 +153,14 @@ public:
         lastCheck = millis();
 
         // If not connected and there is no pending connection request
-        if (!trainerConnected && !doConnect) {
+        if (!state.trainerConnected && !state.doConnect) {
             if (!NimBLEDevice::getScan()->isScanning()) {
                 Serial.println(">>> [SUPERVISOR] Connection missing. Starting scan...");
                 
                 // Safe memory cleanup in case a residual client exists
-                if (pClient != nullptr) {
-                    NimBLEDevice::deleteClient(pClient);
-                    pClient = nullptr;
+                if (ble.client != nullptr) {
+                    NimBLEDevice::deleteClient(ble.client);
+                    ble.client = nullptr;
                 }
                 
                 // Restarts scanner to search for the trainer
@@ -97,40 +171,7 @@ public:
     }
 };
 
-// Global supervisor instance
 TrainerConnectionSupervisor supervisor;
-
-// --- LED LOGIC ---
-void updateLED() {
-    static unsigned long lastBlink = 0;
-    static bool ledOn = false;
-    
-    int p = (int)livePower;
-    int newZone = 0;
-
-    if      (p > THRESHOLDS[6] + (currentZone == 7 ? -DEADBAND : 0)) newZone = 7;
-    else if (p > THRESHOLDS[5] + (currentZone == 6 ? -DEADBAND : 0)) newZone = 6;
-    else if (p > THRESHOLDS[4] + (currentZone == 5 ? -DEADBAND : 0)) newZone = 5;
-    else if (p > THRESHOLDS[3] + (currentZone == 4 ? -DEADBAND : 0)) newZone = 4;
-    else if (p > THRESHOLDS[2] + (currentZone == 3 ? -DEADBAND : 0)) newZone = 3;
-    else if (p > THRESHOLDS[1] + (currentZone == 2 ? -DEADBAND : 0)) newZone = 2;
-    else if (p > THRESHOLDS[0] + (currentZone == 1 ? -DEADBAND : 0)) newZone = 1;
-    else newZone = 0;
-    
-    currentZone = newZone;
-
-    unsigned long interval = 60000 / (liveCadence > 30 ? liveCadence : 60); 
-    if (millis() - lastBlink >= (ledOn ? 100 : interval - 100)) {
-        lastBlink = millis();
-        ledOn = !ledOn;
-        if (ledOn) {
-            led.setPixelColor(0, led.Color(zonesRGB[currentZone][0], zonesRGB[currentZone][1], zonesRGB[currentZone][2]));
-        } else {
-            led.setPixelColor(0, 0); 
-        }
-        led.show();
-    }
-}
 
 // --- ZWIFT -> ESP CALLBACK ---
 class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
@@ -139,30 +180,33 @@ class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
         if (val.length() == 0) return;
 
         uint8_t opCode = val[0];
-        pendingOpCode = opCode;
-        pendingIndicate = true;
+        state.pendingOpCode = opCode;
+        state.pendingIndicate = true;
         Serial.printf(">>> [ZWIFT] Command received: %02X. Processing scheduled.\n", opCode);
 
         switch (opCode) {
-            case 0x00: ergState = SEND_REQ_CTRL; break;
+            case 0x00: 
+                state.ergState = SEND_REQ_CTRL; 
+                break;
             case 0x05:
                 if (val.length() >= 3) {
-                    targetPowerPayload[0] = val[1]; targetPowerPayload[1] = val[2];
-                    ergState = SEND_POWER;
+                    state.targetPowerPayload[0] = val[1]; 
+                    state.targetPowerPayload[1] = val[2];
+                    state.ergState = SEND_POWER;
                 }
                 break;
             case 0x11:
                 if (val.length() >= 7) {
-                    memcpy((void*)targetSimPayload, &val[1], 6);
-                    ergState = SEND_SIMULATION;
-                    lastGradeReceived = ((int16_t)(val[3] | (val[4] << 8))) * 0.01;
+                    memcpy((void*)state.targetSimPayload, &val[1], 6);
+                    state.ergState = SEND_SIMULATION;
+                    state.grade = ((int16_t)(val[3] | (val[4] << 8))) * 0.01;
                 }
                 break;
             default:
                 if (val.length() <= 20) {
-                    memcpy((void*)genericPayload, val.data(), val.length());
-                    genericLen = val.length();
-                    ergState = SEND_GENERIC;
+                    memcpy((void*)state.genericPayload, val.data(), val.length());
+                    state.genericLen = val.length();
+                    state.ergState = SEND_GENERIC;
                 }
                 break;
         }
@@ -171,11 +215,11 @@ class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
 
 class MyServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
-        zwiftConnected = true;
+        state.zwiftConnected = true;
         Serial.println(">>> [CORE 1] Zwift Connected.");
     }
     void onDisconnect(NimBLEServer* pServer) {
-        zwiftConnected = false;
+        state.zwiftConnected = false;
         Serial.println(">>> [CORE 1] Zwift Disconnected.");
         NimBLEDevice::getAdvertising()->start();
     }
@@ -184,9 +228,9 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 class MyScannerCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* device) {
         if (device->getName().find("Cyclo_130") != std::string::npos) {
-            targetDevice = new NimBLEAdvertisedDevice(*device);
+            ble.targetDevice = new NimBLEAdvertisedDevice(*device);
             NimBLEDevice::getScan()->stop();
-            doConnect = true; // Notifies TaskTrainer to connect
+            state.doConnect = true; // Notifies TaskTrainer to connect
         }
     }
 };
@@ -195,38 +239,38 @@ class MyScannerCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 void TaskTrainer(void * pvParameters) {
     for(;;) {
         // If the supervisor found the trainer and activated the doConnect flag
-        if (doConnect && targetDevice != nullptr && !trainerConnected) {
+        if (state.doConnect && ble.targetDevice != nullptr && !state.trainerConnected) {
             Serial.println(">>> [CORE 0] Trying to (re)connect to physical trainer...");
             
-            pClient = NimBLEDevice::createClient();
-            pClient->setClientCallbacks(new TrainerClientCallbacks(), false);
-            pClient->setConnectTimeout(5);
+            ble.client = NimBLEDevice::createClient();
+            ble.client->setClientCallbacks(new TrainerClientCallbacks(), false);
+            ble.client->setConnectTimeout(5);
 
-            if (pClient->connect(targetDevice)) {
-                pClient->discoverAttributes();
-                trainerConnected = true;
-                doConnect = false;
+            if (ble.client->connect(ble.targetDevice)) {
+                ble.client->discoverAttributes();
+                state.trainerConnected = true;
+                state.doConnect = false;
                 Serial.println(">>> [CORE 0] Success! Connected to Physical Trainer.");
                 
                 // SUBSCRIBE TO FTMS
-                NimBLERemoteService* pSvcFTMS = pClient->getService(FTMS_SVC_UUID);
+                NimBLERemoteService* pSvcFTMS = ble.client->getService(FTMS_SVC_UUID);
                 if (pSvcFTMS) {
                     NimBLERemoteCharacteristic* pData = pSvcFTMS->getCharacteristic(FTMS_DATA_CHR_UUID);
                     if (pData) {
                         pData->subscribe(true, [](NimBLERemoteCharacteristic* pC, uint8_t* pD, size_t len, bool isN) {
-                            if (len >= 6) livePower = (int16_t)(pD[4] | (pD[5] << 8));
+                            if (len >= 6) state.power = (int16_t)(pD[4] | (pD[5] << 8));
                         });
                         Serial.println(">>> [CORE 0] FTMS Link Established.");
                     }
-                    pRemoteControlChar = pSvcFTMS->getCharacteristic(FTMS_CTRL_CHR_UUID);
-                    if (pRemoteControlChar) {
-                        auto pDesc = pRemoteControlChar->getDescriptor(NimBLEUUID("2902"));
+                    ble.remoteControlChar = pSvcFTMS->getCharacteristic(FTMS_CTRL_CHR_UUID);
+                    if (ble.remoteControlChar) {
+                        auto pDesc = ble.remoteControlChar->getDescriptor(NimBLEUUID("2902"));
                         if (pDesc) pDesc->writeValue((uint8_t*)("\x02\x00"), 2, true);
                     }
                 }
 
                 // SUBSCRIBE TO CSC
-                NimBLERemoteService* pSvcCSC = pClient->getService(CSC_SVC_UUID);
+                NimBLERemoteService* pSvcCSC = ble.client->getService(CSC_SVC_UUID);
                 if (pSvcCSC) {
                     NimBLERemoteCharacteristic* pCadData = pSvcCSC->getCharacteristic(CSC_MEAS_CHR_UUID);
                     if (pCadData) {
@@ -234,16 +278,17 @@ void TaskTrainer(void * pvParameters) {
                             if (len >= 5) {
                                 uint32_t currentRev = (pD[1] | (pD[2] << 8));
                                 uint16_t currentTime = (pD[3] | (pD[4] << 8));
-                                if (lastRevCount != 0 && currentRev != lastRevCount) {
-                                    uint16_t timeDiff = currentTime - lastEventTime;
-                                    uint32_t revDiff = currentRev - lastRevCount;
-                                    if (currentTime < lastEventTime) timeDiff = (65535 - lastEventTime) + currentTime;
+                                if (state.lastRevCount != 0 && currentRev != state.lastRevCount) {
+                                    uint16_t timeDiff = currentTime - state.lastEventTime;
+                                    uint32_t revDiff = currentRev - state.lastRevCount;
+                                    if (currentTime < state.lastEventTime) timeDiff = (65535 - state.lastEventTime) + currentTime;
                                     if (timeDiff > 0) {
-                                        liveCadence = (float)(revDiff * 1024.0 * 60.0) / timeDiff;
-                                        lastCadenceUpdateMillis = millis(); 
+                                        state.cadence = (float)(revDiff * 1024.0 * 60.0) / timeDiff;
+                                        state.lastCadenceUpdateMillis = millis(); 
                                     }
                                 }
-                                lastRevCount = currentRev; lastEventTime = currentTime;
+                                state.lastRevCount = currentRev; 
+                                state.lastEventTime = currentTime;
                             }
                         });
                         Serial.println(">>> [CORE 0] CSC Link Established.");
@@ -251,24 +296,25 @@ void TaskTrainer(void * pvParameters) {
                 }
             } else {
                 Serial.println("!!! [CORE 0] Connection failed. Handing over to Supervisor.");
-                NimBLEDevice::deleteClient(pClient);
-                pClient = nullptr;
-                doConnect = false;
+                NimBLEDevice::deleteClient(ble.client);
+                ble.client = nullptr;
+                state.doConnect = false;
             }
         }
 
-        if (trainerConnected && pRemoteControlChar) {
-            if (ergState == SEND_REQ_CTRL) {
+        // Process Command Queue to Physical Trainer
+        if (state.trainerConnected && ble.remoteControlChar) {
+            if (state.ergState == SEND_REQ_CTRL) {
                 uint8_t req[1] = {0x00};
-                if (pRemoteControlChar->writeValue(req, 1, true)) ergState = IDLE;
-            } else if (ergState == SEND_POWER) {
-                uint8_t cmd[3] = {0x05, targetPowerPayload[0], targetPowerPayload[1]};
-                if (pRemoteControlChar->writeValue(cmd, 3, true)) ergState = IDLE;
-            } else if (ergState == SEND_SIMULATION) {
-                uint8_t cmd[7] = {0x11, targetSimPayload[0], targetSimPayload[1], targetSimPayload[2], targetSimPayload[3], targetSimPayload[4], targetSimPayload[5]};
-                if (pRemoteControlChar->writeValue(cmd, 7, true)) ergState = IDLE;
-            } else if (ergState == SEND_GENERIC) {
-                if (pRemoteControlChar->writeValue((uint8_t*)genericPayload, genericLen, true)) ergState = IDLE;
+                if (ble.remoteControlChar->writeValue(req, 1, true)) state.ergState = IDLE;
+            } else if (state.ergState == SEND_POWER) {
+                uint8_t cmd[3] = {0x05, state.targetPowerPayload[0], state.targetPowerPayload[1]};
+                if (ble.remoteControlChar->writeValue(cmd, 3, true)) state.ergState = IDLE;
+            } else if (state.ergState == SEND_SIMULATION) {
+                uint8_t cmd[7] = {0x11, state.targetSimPayload[0], state.targetSimPayload[1], state.targetSimPayload[2], state.targetSimPayload[3], state.targetSimPayload[4], state.targetSimPayload[5]};
+                if (ble.remoteControlChar->writeValue(cmd, 7, true)) state.ergState = IDLE;
+            } else if (state.ergState == SEND_GENERIC) {
+                if (ble.remoteControlChar->writeValue((uint8_t*)state.genericPayload, state.genericLen, true)) state.ergState = IDLE;
             }
         }
         
@@ -280,8 +326,7 @@ void setup() {
     Serial.begin(115200);
     Serial.println("--- Starting FTMS BRIDGE (V2 - Auto Reconnect) ---");
     
-    led.begin();
-    led.setBrightness(20);
+    statusLed.begin();
     
     uint8_t newMac[6] = {0x32, 0xAE, 0xA4, 0x07, 0x0D, 0x01};
     esp_base_mac_addr_set(newMac);
@@ -296,9 +341,9 @@ void setup() {
     uint8_t feat[8] = {0x0A, 0x40, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00};
     pFTMS->createCharacteristic(FTMS_FEAT_CHR_UUID, NIMBLE_PROPERTY::READ)->setValue(feat, 8);
     
-    pBikeDataChar = pFTMS->createCharacteristic(FTMS_DATA_CHR_UUID, NIMBLE_PROPERTY::NOTIFY);
-    pServerControlChar = pFTMS->createCharacteristic(FTMS_CTRL_CHR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    pServerControlChar->setCallbacks(new ServerControlCallbacks());
+    ble.bikeDataChar = pFTMS->createCharacteristic(FTMS_DATA_CHR_UUID, NIMBLE_PROPERTY::NOTIFY);
+    ble.serverControlChar = pFTMS->createCharacteristic(FTMS_CTRL_CHR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
+    ble.serverControlChar->setCallbacks(new ServerControlCallbacks());
     pFTMS->start();
 
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
@@ -307,9 +352,6 @@ void setup() {
 
     xTaskCreatePinnedToCore(TaskTrainer, "TaskTrainer", 4096, NULL, 1, NULL, 0);
     NimBLEDevice::getScan()->setAdvertisedDeviceCallbacks(new MyScannerCallbacks());
-    
-    // The first scan is now done by the supervisor itself in the loop,
-    // so we don't need to start the scan here in setup.
 }
 
 // --- CORE 1: MAIN EXECUTION ---
@@ -317,46 +359,47 @@ void loop() {
     // 1. Calls the Connection Supervisor
     supervisor.run();
 
-    if (zwiftConnected) {
-        updateLED();
-    } 
-    else {        
-        static bool ledWasOff = false;
-        if (!ledWasOff) {
-            led.setPixelColor(0, 0); 
-            led.show();
-            ledWasOff = true;
-        }
+    // 2. Manage LEDs based on Zwift Connection
+    if (state.zwiftConnected) {
+        statusLed.update(state.power, state.cadence);
+    } else {        
+        statusLed.turnOff();
     }
 
-    if (millis() - lastCadenceUpdateMillis > 2000) {
-        liveCadence = 0;
+    // 3. Cadence Drop-off Check
+    if (millis() - state.lastCadenceUpdateMillis > 2000) {
+        state.cadence = 0;
     }
 
-    if (pendingIndicate && zwiftConnected) {
-        uint8_t response[3] = {0x80, pendingOpCode, 0x01}; 
-        pServerControlChar->setValue(response, 3);
-        pServerControlChar->indicate();
-        pendingIndicate = false;
-        Serial.printf(">>> [ZWIFT] Asynchronous indication sent: 80-%02X-01\n", pendingOpCode);
+    // 4. Handle Pending Zwift Indications
+    if (state.pendingIndicate && state.zwiftConnected && ble.serverControlChar) {
+        uint8_t response[3] = {0x80, state.pendingOpCode, 0x01}; 
+        ble.serverControlChar->setValue(response, 3);
+        ble.serverControlChar->indicate();
+        state.pendingIndicate = false;
+        Serial.printf(">>> [ZWIFT] Asynchronous indication sent: 80-%02X-01\n", state.pendingOpCode);
     }
 
-    if (zwiftConnected) {
+    // 5. Notify Zwift Periodically
+    if (state.zwiftConnected && ble.bikeDataChar) {
         static unsigned long lastNotify = 0;
         if (millis() - lastNotify >= 1000) {
             lastNotify = millis();
             uint8_t d[8] = {0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-            uint16_t c = (uint16_t)(liveCadence * 2.0);
-            int16_t p = (int16_t)livePower;
+            uint16_t c = (uint16_t)(state.cadence * 2.0);
+            int16_t p = (int16_t)state.power;
             d[4] = c & 0xFF; d[5] = (c >> 8) & 0xFF; d[6] = p & 0xFF; d[7] = (p >> 8) & 0xFF;
-            pBikeDataChar->setValue(d, 8); pBikeDataChar->notify();
+            
+            ble.bikeDataChar->setValue(d, 8); 
+            ble.bikeDataChar->notify();
             
             Serial.printf("[STATUS] PWR: %3dW | CAD: %3.0f | INC: %5.2f%% | CONNECTED: %s\n", 
-              (int)livePower, 
-              (float)liveCadence, 
-              (float)lastGradeReceived,
-              trainerConnected ? "YES" : "NO");
+              (int)state.power, 
+              (float)state.cadence, 
+              (float)state.grade,
+              state.trainerConnected ? "YES" : "NO");
         }
     }
+    
     vTaskDelay(10);
 }
