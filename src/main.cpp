@@ -1,6 +1,6 @@
-// FTMS BRIDGE (Com Supervisor de Conexão)
-// Desenvolvido por Alessandro Miertschink
-// Última atualização: 2026-03-18
+// FTMS BRIDGE
+// Developed by Alessandro Miertschink (with help from Gemini)
+// Last update: 2026-03-19
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -12,7 +12,7 @@
 #define LED_COUNT 1
 Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// --- UUIDS DO PROTOCOLO FTMS/CSC ---
+// --- FTMS/CSC PROTOCOL UUIDS ---
 static NimBLEUUID FTMS_SVC_UUID("1826");
 static NimBLEUUID FTMS_FEAT_CHR_UUID("2ACC");
 static NimBLEUUID FTMS_DATA_CHR_UUID("2AD2");
@@ -20,13 +20,13 @@ static NimBLEUUID FTMS_CTRL_CHR_UUID("2AD9");
 static NimBLEUUID CSC_SVC_UUID("1816");       
 static NimBLEUUID CSC_MEAS_CHR_UUID("2A5B");  
 
-// --- VARIÁVEIS GLOBAIS ---
+// --- GLOBAL VARIABLES ---
 volatile float livePower = 10.0, liveCadence = 10.0;
 volatile float lastGradeReceived = 10.0;
 volatile bool trainerConnected = false, zwiftConnected = false;
 volatile bool doConnect = false;
 
-// Variáveis de controle de Cadência (CSC)
+// Cadence control variables (CSC)
 volatile uint32_t lastRevCount = 0;
 volatile uint16_t lastEventTime = 0;
 volatile unsigned long lastCadenceUpdateMillis = 0;
@@ -56,48 +56,48 @@ NimBLERemoteCharacteristic* pRemoteControlChar = nullptr;
 NimBLECharacteristic *pBikeDataChar, *pServerControlChar;
 NimBLEAdvertisedDevice* targetDevice = nullptr;
 
-// --- CALLBACKS DE DESCONEXÃO DO ROLO (CLIENTE) ---
+// --- TRAINER DISCONNECTION CALLBACKS (CLIENT) ---
 class TrainerClientCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pClient) {
         trainerConnected = false;
         doConnect = false;
         livePower = 0;
         liveCadence = 0;
-        Serial.println("!!! [ALERTA] Rolo Físico perdeu o sinal. O Supervisor assumirá.");
+        Serial.println("!!! [ALERT] Physical Trainer lost signal. Supervisor will take over.");
     }
 };
 
-// --- MÓDULO SUPERVISOR DE CONEXÃO ---
+// --- CONNECTION SUPERVISOR MODULE ---
 class TrainerConnectionSupervisor {
 private:
     unsigned long lastCheck = 0;
-    const unsigned long checkInterval = 3000; // Verifica a cada 3 segundos
+    const unsigned long checkInterval = 3000; // Checks every 3 seconds
 
 public:
     void run() {
         if (millis() - lastCheck < checkInterval) return;
         lastCheck = millis();
 
-        // Se não estiver conectado e não houver um pedido pendente de conexão
+        // If not connected and there is no pending connection request
         if (!trainerConnected && !doConnect) {
             if (!NimBLEDevice::getScan()->isScanning()) {
-                Serial.println(">>> [SUPERVISOR] Conexão ausente. Iniciando varredura...");
+                Serial.println(">>> [SUPERVISOR] Connection missing. Starting scan...");
                 
-                // Limpeza segura de memória caso exista um cliente residual
+                // Safe memory cleanup in case a residual client exists
                 if (pClient != nullptr) {
                     NimBLEDevice::deleteClient(pClient);
                     pClient = nullptr;
                 }
                 
-                // Reinicia o scanner em busca do rolo
+                // Restarts scanner to search for the trainer
                 NimBLEDevice::getScan()->clearResults();
-                NimBLEDevice::getScan()->start(5, false); // Busca por 5 segundos
+                NimBLEDevice::getScan()->start(5, false); // Scans for 5 seconds
             }
         }
     }
 };
 
-// Instância global do supervisor
+// Global supervisor instance
 TrainerConnectionSupervisor supervisor;
 
 // --- LED LOGIC ---
@@ -132,7 +132,7 @@ void updateLED() {
     }
 }
 
-// --- CALLBACK ZWIFT -> ESP ---
+// --- ZWIFT -> ESP CALLBACK ---
 class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pChar) {
         std::string val = pChar->getValue();
@@ -141,7 +141,7 @@ class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
         uint8_t opCode = val[0];
         pendingOpCode = opCode;
         pendingIndicate = true;
-        Serial.printf(">>> [ZWIFT] Comando recebido: %02X. Processamento agendado.\n", opCode);
+        Serial.printf(">>> [ZWIFT] Command received: %02X. Processing scheduled.\n", opCode);
 
         switch (opCode) {
             case 0x00: ergState = SEND_REQ_CTRL; break;
@@ -172,11 +172,11 @@ class ServerControlCallbacks : public NimBLECharacteristicCallbacks {
 class MyServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
         zwiftConnected = true;
-        Serial.println(">>> [CORE 1] Zwift Conectado.");
+        Serial.println(">>> [CORE 1] Zwift Connected.");
     }
     void onDisconnect(NimBLEServer* pServer) {
         zwiftConnected = false;
-        Serial.println(">>> [CORE 1] Zwift Desconectado.");
+        Serial.println(">>> [CORE 1] Zwift Disconnected.");
         NimBLEDevice::getAdvertising()->start();
     }
 };
@@ -186,17 +186,17 @@ class MyScannerCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         if (device->getName().find("Cyclo_130") != std::string::npos) {
             targetDevice = new NimBLEAdvertisedDevice(*device);
             NimBLEDevice::getScan()->stop();
-            doConnect = true; // Avisa a TaskTrainer para conectar
+            doConnect = true; // Notifies TaskTrainer to connect
         }
     }
 };
 
-// --- CORE 0: COMUNICAÇÃO COM O ROLO ---
+// --- CORE 0: COMMUNICATION WITH TRAINER ---
 void TaskTrainer(void * pvParameters) {
     for(;;) {
-        // Se o supervisor encontrou o rolo e ativou a flag doConnect
+        // If the supervisor found the trainer and activated the doConnect flag
         if (doConnect && targetDevice != nullptr && !trainerConnected) {
-            Serial.println(">>> [CORE 0] Tentando (re)conectar ao rolo físico...");
+            Serial.println(">>> [CORE 0] Trying to (re)connect to physical trainer...");
             
             pClient = NimBLEDevice::createClient();
             pClient->setClientCallbacks(new TrainerClientCallbacks(), false);
@@ -206,9 +206,9 @@ void TaskTrainer(void * pvParameters) {
                 pClient->discoverAttributes();
                 trainerConnected = true;
                 doConnect = false;
-                Serial.println(">>> [CORE 0] Sucesso! Conectado ao Rolo Físico.");
+                Serial.println(">>> [CORE 0] Success! Connected to Physical Trainer.");
                 
-                // SUBSCREVE FTMS
+                // SUBSCRIBE TO FTMS
                 NimBLERemoteService* pSvcFTMS = pClient->getService(FTMS_SVC_UUID);
                 if (pSvcFTMS) {
                     NimBLERemoteCharacteristic* pData = pSvcFTMS->getCharacteristic(FTMS_DATA_CHR_UUID);
@@ -216,7 +216,7 @@ void TaskTrainer(void * pvParameters) {
                         pData->subscribe(true, [](NimBLERemoteCharacteristic* pC, uint8_t* pD, size_t len, bool isN) {
                             if (len >= 6) livePower = (int16_t)(pD[4] | (pD[5] << 8));
                         });
-                        Serial.println(">>> [CORE 0] Link FTMS Estabelecido.");
+                        Serial.println(">>> [CORE 0] FTMS Link Established.");
                     }
                     pRemoteControlChar = pSvcFTMS->getCharacteristic(FTMS_CTRL_CHR_UUID);
                     if (pRemoteControlChar) {
@@ -225,7 +225,7 @@ void TaskTrainer(void * pvParameters) {
                     }
                 }
 
-                // SUBSCREVE CSC
+                // SUBSCRIBE TO CSC
                 NimBLERemoteService* pSvcCSC = pClient->getService(CSC_SVC_UUID);
                 if (pSvcCSC) {
                     NimBLERemoteCharacteristic* pCadData = pSvcCSC->getCharacteristic(CSC_MEAS_CHR_UUID);
@@ -246,11 +246,11 @@ void TaskTrainer(void * pvParameters) {
                                 lastRevCount = currentRev; lastEventTime = currentTime;
                             }
                         });
-                        Serial.println(">>> [CORE 0] Link CSC Estabelecido.");
+                        Serial.println(">>> [CORE 0] CSC Link Established.");
                     }
                 }
             } else {
-                Serial.println("!!! [CORE 0] Falha na conexão. Repassando para o Supervisor.");
+                Serial.println("!!! [CORE 0] Connection failed. Handing over to Supervisor.");
                 NimBLEDevice::deleteClient(pClient);
                 pClient = nullptr;
                 doConnect = false;
@@ -278,7 +278,7 @@ void TaskTrainer(void * pvParameters) {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("--- Iniciando FTMS BRIDGE (V2 - Auto Reconnect) ---");
+    Serial.println("--- Starting FTMS BRIDGE (V2 - Auto Reconnect) ---");
     
     led.begin();
     led.setBrightness(20);
@@ -308,13 +308,13 @@ void setup() {
     xTaskCreatePinnedToCore(TaskTrainer, "TaskTrainer", 4096, NULL, 1, NULL, 0);
     NimBLEDevice::getScan()->setAdvertisedDeviceCallbacks(new MyScannerCallbacks());
     
-    // O primeiro scan agora é feito pelo próprio supervisor no loop,
-    // então não precisamos iniciar o scan aqui no setup.
+    // The first scan is now done by the supervisor itself in the loop,
+    // so we don't need to start the scan here in setup.
 }
 
-// --- CORE 1: EXECUÇÃO PRINCIPAL ---
+// --- CORE 1: MAIN EXECUTION ---
 void loop() {
-    // 1. Chama o Supervisor de Conexão
+    // 1. Calls the Connection Supervisor
     supervisor.run();
 
     if (zwiftConnected) {
@@ -338,7 +338,7 @@ void loop() {
         pServerControlChar->setValue(response, 3);
         pServerControlChar->indicate();
         pendingIndicate = false;
-        Serial.printf(">>> [ZWIFT] Indicação assíncrona enviada: 80-%02X-01\n", pendingOpCode);
+        Serial.printf(">>> [ZWIFT] Asynchronous indication sent: 80-%02X-01\n", pendingOpCode);
     }
 
     if (zwiftConnected) {
@@ -351,11 +351,11 @@ void loop() {
             d[4] = c & 0xFF; d[5] = (c >> 8) & 0xFF; d[6] = p & 0xFF; d[7] = (p >> 8) & 0xFF;
             pBikeDataChar->setValue(d, 8); pBikeDataChar->notify();
             
-            Serial.printf("[STATUS] PWR: %3dW | CAD: %3.0f | INC: %5.2f%% | CONECTADO: %s\n", 
+            Serial.printf("[STATUS] PWR: %3dW | CAD: %3.0f | INC: %5.2f%% | CONNECTED: %s\n", 
               (int)livePower, 
               (float)liveCadence, 
               (float)lastGradeReceived,
-              trainerConnected ? "SIM" : "NAO");
+              trainerConnected ? "YES" : "NO");
         }
     }
     vTaskDelay(10);
